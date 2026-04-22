@@ -140,3 +140,4 @@ The SpaceMouse helper uses delta pose updates with `RUCKIG_POSE` under
 - `Ruckig` is vendored under `third_party/ruckig` and compiled locally as part of the C++ stack.
 - The current admittance prototype still lives in Python scripts and is not yet moved into the NUC real-time loop.
 # PEIRASTIC_control
+# PEIRASTIC_control
