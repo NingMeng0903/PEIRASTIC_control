@@ -1,0 +1,58 @@
+version: 1
+formatters:
+  simple:
+    format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file_brief:
+    format: "[Controller %(levelname)s] %(asctime)s - %(message)s"
+  peirastic_console_brief: 
+    class: peirastic.utils.log_utils.PeirasticColorFormatter
+  peirastic_example_console_brief: 
+    class: peirastic.utils.log_utils.PeirasticExampleColorFormatter
+  project_console_brief:
+    class: peirastic.utils.log_utils.ProjectColorFormatter
+handlers:
+  peirastic_console:
+    class : logging.StreamHandler
+    formatter: peirastic_console_brief
+    stream  : ext://sys.stdout
+  peirastic_example_console:
+    class : logging.StreamHandler
+    formatter: peirastic_example_console_brief
+    stream  : ext://sys.stdout
+  project_console:
+    class : logging.StreamHandler
+    formatter: project_console_brief
+    stream  : ext://sys.stdout
+  console:
+    class : logging.StreamHandler
+    formatter: simple
+    level   : CRITICAL
+    stream  : ext://sys.stdout
+  file:
+    class : logging.FileHandler
+    level: DEBUG
+    formatter: file_brief
+    filename: logs/debug.log
+  error:
+    class: logging.handlers.RotatingFileHandler
+    level: ERROR
+    formatter: file_brief
+    filename: logs/error.log
+    maxBytes: 10485760
+    backupCount: 20
+    encoding: utf8
+
+loggers:
+  peirastic:
+    level: INFO
+    handlers: [peirastic_console, file, error]
+  peirastic_examples:
+    level: INFO
+    handlers: [peirastic_example_console, file, error]
+  project:
+    level: INFO
+    handlers: [project_console, file, error]
+
+root:
+  level: FATAL
+  handlers: [console, error]

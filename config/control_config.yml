@@ -1,0 +1,11 @@
+CONTROL:
+        SAFETY:
+                MAX_TORQUE: 5
+                MIN_TORQUE: -5
+                MAX_TRANS_SPEED: 0.10
+                MIN_TRANS_SPEED: -0.10
+                MAX_ROT_SPEED: 0.18
+                MIN_ROT_SPEED: -0.18
+        # 0 = never stop the control loop when ZMQ has no new messages (client may exit).
+        # Set to 20 (or similar) to restore legacy auto-shutdown after idle periods.
+        ZMQ_IDLE_TERMINATE_STEPS: 0

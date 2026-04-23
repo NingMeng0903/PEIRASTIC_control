@@ -1,0 +1,56 @@
+interface_cfg: local-host.yml
+control_freq: 250.0
+
+reset_joints_on_start: false
+joint_reset_timeout: 30.0
+init_joint_angles: [0.0, 0.0, 0.0, -1.8, 0.0, 1.8, 0.0]
+
+netft_calibration:
+  env_key: PEIRASTIC_NETFT_CALIB_YAML
+  default_path: ~/.local/share/peirastic/netft/config/netft_calib_result.yaml
+
+tool:
+  eef_offset: [0.0, 0.0, 0.24]
+  eef_offset_rpy: [0.0, 0.0, 2.8797932657906435]
+
+command_input:
+  pose_topic: /peirastic/admittance/target_pose
+  twist_topic: /peirastic/admittance/target_twist
+  twist_timeout: 0.25
+  linear_scale: 1.0
+  angular_scale: 1.0
+
+admittance:
+  force_target_z: -5.0
+  mass: 0.15
+  damping_down: 40.0
+  damping_up: 20.0
+  force_derivative_gain: 0.0
+  accel_limit: 2.0
+  force_deadband: 0.3
+  force_alpha: 0.2
+  max_admittance_position: 0.15
+  max_admittance_velocity: 0.5
+  bias_wait: 1.0
+
+safety:
+  max_position_error: 0.05
+  max_rotation_error: 0.8
+
+osc:
+  kp_translation: [900.0, 900.0, 900.0]
+  kp_rotation: [1000.0, 1000.0, 1000.0]
+  residual_mass_vec: [0.0, 0.0, 0.0, 0.0, 0.1, 0.3, 0.3]
+  action_scale:
+    translation: 1.0
+    rotation: 1.0
+  traj_interpolator_cfg:
+    traj_interpolator_type: LINEAR_POSE
+    time_fraction: 0.8
+  state_estimator_cfg:
+    is_estimation: true
+    state_estimator_type: EXPONENTIAL_SMOOTHING
+    alpha_q: 0.99
+    alpha_dq: 0.99
+    alpha_eef: 0.99
+    alpha_eef_vel: 0.99

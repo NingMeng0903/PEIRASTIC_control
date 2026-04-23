@@ -1,0 +1,5 @@
+# Optional overrides for named joint groups used by peirastic.netft_data_acquisition.
+# Keys must match the MoveIt-style names from the original script: ready / ftcalib_jgroup
+#
+# Example:
+# ready: [q1, q2, q3, q4, q5, q6, q7]

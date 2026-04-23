@@ -1,0 +1,9 @@
+{
+    "robot_ip": "172.16.0.2",
+    "pc_ip": "127.0.0.1",
+    "master_ip": "127.0.0.1",
+    "control_port": 5555,
+    "state_port": 5556,
+    "gripper_port": 5557,
+    "user_interface_port": 5558
+}

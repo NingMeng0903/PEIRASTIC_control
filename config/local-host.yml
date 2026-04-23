@@ -1,0 +1,69 @@
+# Single-machine: same as charmander structure but PC/NUC use localhost
+ARM_LOGGER:
+  CONSOLE:
+    LEVEL: info
+    LOGGER_NAME: arm_logger
+    USE: true
+  FILE:
+    LEVEL: debug
+    LOGGER_NAME: logs/Controller_control_arm_program.log
+    USE: true
+CONTROL:
+  POLICY_RATE: 200
+  STATE_PUBLISHER_RATE: 200
+  TRAJ_RATE: 500
+  ZMQ_NOBLOCK: true
+GRIPPER_LOGGER:
+  CONSOLE:
+    LEVEL: info
+    LOGGER_NAME: gripper_logger
+    USE: true
+  FILE:
+    LEVEL: debug
+    LOGGER_NAME: logs/Controller_control_gripper_program.log
+    USE: true
+NUC:
+  GRIPPER_PUB_PORT: 5558
+  GRIPPER_SUB_PORT: 5557
+  IP: localhost
+  NAME: alice
+  PUB_PORT: 5556
+  SUB_PORT: 5555
+PC:
+  IP: localhost
+  NAME: rosie
+ROBOT:
+  IP: 172.16.0.2
+  LOAD:
+    COM:
+    - 0.0003
+    - 0.0021
+    - 0.0645
+    INERTIA:
+    - 0.01
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.01
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.01
+    MASS: 0.25
+    
+
+    # COM:
+    # - 0.0003
+    # - 0.0021
+    # - 0.0645
+    # INERTIA:
+    # - 0.01
+    # - 0.0
+    # - 0.0
+    # - 0.0
+    # - 0.01
+    # - 0.0
+    # - 0.0
+    # - 0.0
+    # - 0.01
+    # MASS: 0.512
