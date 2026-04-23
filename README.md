@@ -1,13 +1,14 @@
 # PEIRASTIC_control
 
-`PEIRASTIC_control` is a standalone Franka Panda control stack built on top of
-`libfranka`.
+`PEIRASTIC_control` is a self-contained Franka Panda control stack built on `libfranka`.
 
 It contains:
 
-- `franka-interface/`: the real-time C++ control node that runs on the robot PC
-- `peirastic/`: the Python package used on the desktop PC to send commands and read robot state
-- `proto/`: the shared protobuf command/state definitions
+- `franka-interface/`: the real-time C++ control node that runs on the robot PC (NUC)
+- `peirastic/`: the Python package that runs on the desktop PC and talks to the NUC over ZMQ
+- `proto/`: shared protobuf command/state definitions
+
+**Full documentation:** see `peirastic/README.md` (desktop API, scripts, NetFT, admittance, and detailed tuning notes).
 
 ## Architecture
 
@@ -15,11 +16,9 @@ It contains:
 Desktop Python (peirastic.FrankaInterface)  <----ZMQ---->  NUC C++ (franka-interface)  ->  Robot
 ```
 
-The desktop PC does not connect to the robot directly. It sends control
-messages through ZMQ. The NUC runs the real-time `libfranka` loop and executes
-the selected controller.
+The desktop does not connect to the robot directly. It streams control messages over ZMQ. The NUC runs the real-time `libfranka` loop and executes the selected controller.
 
-## Supported Controllers
+## Supported controllers (NUC)
 
 - `OSC_POSE`
 - `OSC_POSITION`
@@ -28,39 +27,48 @@ the selected controller.
 - `JOINT_IMPEDANCE`
 - `CARTESIAN_VELOCITY`
 
-`CARTESIAN_VELOCITY` is the only Cartesian control mode. It supports both
-velocity commands and `RUCKIG_POSE` absolute pose tracking with jerk-limited
-retargeting in the real-time loop.
+`CARTESIAN_VELOCITY` is the **Cartesian-velocity** command path (via `libfranka` Cartesian velocity control). The OSC family is **operational-space torque control** (task-space impedance) and is not the same interface as `CARTESIAN_VELOCITY`.
 
-## NUC Build and Run
+In `CARTESIAN_VELOCITY` mode, you can send velocity-style commands, and you can also use `RUCKIG_POSE` for smooth absolute pose tracking (translation uses Ruckig smoothing; see the C++ callback for orientation handling details).
 
-Build on a local Linux filesystem when possible. Some removable filesystems do
-not support the symlinks created by shared libraries.
+## NUC build and run
+
+Build on a local Linux filesystem when possible. Some removable filesystems do not support the symlinks created by shared libraries.
 
 ```bash
 cd /path/to/PEIRASTIC_control
 make
 ```
 
-This builds `bin/franka-interface`.
+This builds `bin/franka-interface` and `bin/gripper-interface` at the **repository root** (via `make install` into the tree).
 
-If the source tree is stored on a removable filesystem, use an out-of-tree
-build directory on a local Linux filesystem:
+If the source tree is stored on a removable filesystem, use an out-of-tree build directory on a local Linux filesystem:
 
 ```bash
 cmake -S . -B /tmp/peirastic_build -DCMAKE_BUILD_TYPE=Release -DBUILD_FRANKA=1 -DBUILD_PEIRASTIC=1
 cmake --build /tmp/peirastic_build -j4 --target franka-interface py_protobuf
 ```
 
-Start the control node on the NUC:
+### Start the real-time node (single machine)
+
+From the repository root (so `./bin/...` resolves correctly):
 
 ```bash
+cd /path/to/PEIRASTIC_control
 ./bin/franka-interface config/local-host.yml
 ```
 
-## Desktop Installation
+Optional gripper process:
 
-Create and activate a Python environment on the desktop PC:
+```bash
+./bin/gripper-interface config/local-host.yml
+```
+
+### Two-machine deployment
+
+For a two-machine setup, start from `config/charmander.yml` and set `ROBOT.IP`, `NUC.IP`, and `PC.IP` to the robot, NUC, and desktop addresses, then run the same binaries with that file.
+
+## Desktop installation
 
 ```bash
 cd /path/to/PEIRASTIC_control
@@ -71,15 +79,12 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-If you use the SpaceMouse USB driver, `hidapi` is installed from
-`requirements.txt`.
+## Desktop configuration
 
-## Desktop Configuration
-
-Edit `config/local-host.yml` and verify at least:
+`peirastic` defaults to `config/local-host.yml` for most CLI entry points. Edit the YAML and verify at least:
 
 - `ROBOT.IP`
-- `NUC.IP`
+- `NUC.IP` / `PC.IP` (as appropriate for your topology)
 - `NUC.SUB_PORT`
 - `NUC.PUB_PORT`
 - `NUC.GRIPPER_SUB_PORT`
@@ -87,7 +92,7 @@ Edit `config/local-host.yml` and verify at least:
 
 The desktop must be able to reach the NUC over the configured ports.
 
-## Desktop Usage
+## Desktop usage (minimal)
 
 ### Python API
 
@@ -110,34 +115,16 @@ robot.control(
 
 For delta commands, set `is_delta: true` in the controller config.
 
-### SpaceMouse Teleoperation
-
-Run SpaceMouse teleoperation from the desktop:
+### SpaceMouse teleoperation (CLI)
 
 ```bash
 peirastic.spacemouse_control --interface-cfg local-host.yml --controller-type OSC_POSE
 ```
 
-Available controller types for the SpaceMouse script:
-
-- `OSC_POSE`
-- `OSC_POSITION`
-- `OSC_YAW`
-- `CARTESIAN_VELOCITY`
-
-Example for Cartesian pose tracking through velocity mode:
-
-```bash
-peirastic.spacemouse_control --interface-cfg local-host.yml --controller-type CARTESIAN_VELOCITY
-```
-
-The SpaceMouse helper uses delta pose updates with `RUCKIG_POSE` under
-`CARTESIAN_VELOCITY`.
+`CARTESIAN_VELOCITY` in the SpaceMouse example script is configured as a **delta** command path (not the same thing as `move_pose()`-style `RUCKIG_POSE` absolute tracking).
 
 ## Notes
 
 - This repository is self-contained and does not require `deoxys_control` at runtime.
-- `Ruckig` is vendored under `third_party/ruckig` and compiled locally as part of the C++ stack.
-- The current admittance prototype still lives in Python scripts and is not yet moved into the NUC real-time loop.
-# PEIRASTIC_control
-# PEIRASTIC_control
+- `Ruckig` is vendored under `third_party/ruckig` and built as part of the C++ stack.
+- The admittance example (`peirastic.admittance_target_follow`) is a **Python** outer loop and is not yet moved into the NUC real-time loop.
