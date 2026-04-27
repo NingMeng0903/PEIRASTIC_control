@@ -21,9 +21,7 @@ def add_robot_config_arguments(parser):
 
 def add_controller_config_arguments(parser):
     parser.add_argument("--controller-type", type=str, default="OSC_POSE")
-    parser.add_argument(
-        "--controller-cfg", type=str, default="osc-position-controller.yml"
-    )
+    parser.add_argument("--controller-cfg", type=str, default="osc-pose-controller.yml")
 
 
 def robot_config_parse_args(parser=None):
@@ -61,6 +59,8 @@ def get_available_controller_configs(config_folder: str = None, verbose: bool = 
             print("Found file: ", config_file_name)
             print_controller_config_from_file(config_file_name)
         config = YamlConfig(config_file_name).as_easydict()
+        if "controller_type" not in config:
+            continue
         config_dict[config["controller_type"]] = config
     return config_dict
 
@@ -77,16 +77,6 @@ def get_default_controller_config(controller_type: str) -> EasyDict:
     if controller_type == "OSC_POSE":
         controller_cfg = YamlConfig(
             os.path.join(config_root, "osc-pose-controller.yml")
-        ).as_easydict()
-        controller_cfg = verify_controller_config(controller_cfg)
-    elif controller_type == "OSC_POSITION":
-        controller_cfg = YamlConfig(
-            os.path.join(config_root, "osc-position-controller.yml")
-        ).as_easydict()
-        controller_cfg = verify_controller_config(controller_cfg)
-    elif controller_type == "OSC_YAW":
-        controller_cfg = YamlConfig(
-            os.path.join(config_root, "osc-yaw-controller.yml")
         ).as_easydict()
         controller_cfg = verify_controller_config(controller_cfg)
     elif controller_type == "JOINT_IMPEDANCE":
@@ -133,8 +123,6 @@ def verify_controller_config(controller_cfg: dict, use_default=True):
 
     if controller_cfg["controller_type"] in [
         "OSC_POSE",
-        "OSC_YAW",
-        "OSC_POSITION",
     ]:
         if not check_attr(controller_cfg, "Kp"):
             controller_cfg["Kp"] = {"translation": [150.0] * 3, "rotation": [250.0] * 3}

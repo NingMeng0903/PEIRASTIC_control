@@ -6,7 +6,7 @@ real-time C++ `franka-interface` process. The high-level API includes:
 
 - **Joint reset** and **joint-mode control** (`JOINT_POSITION`, `JOINT_IMPEDANCE`)
 - **Cartesian** target following (velocity commands, `RUCKIG_POSE` / `move_pose` pose tracking)
-- **OSC** target following (`OSC_POSE`, `OSC_POSITION`, `OSC_YAW`)
+- **OSC** target following (`OSC_POSE`)
 - **Admittance** (Python outer loop, OSC inner loop, NetFT wrench)
 - **Dynamic mode switching** (swap controller types at runtime; session-scoped `control_session` / `session_hard_reset` to avoid half-initialized or stale interpolator state)
 - **NetFT** calibration, identification, and named joint targets
@@ -76,7 +76,7 @@ Useful entry points after install (more in `setup.py`):
 
 - `peirastic.get_controller_info` / `peirastic.get_controller_list`
 - `peirastic.reset_joints`
-- `peirastic.admittance_target_follow`
+- `peirastic.spacenav_mode_switch_test`
 - `peirastic.netft_data_acquisition`
 
 ### 4. Configuration (single-machine, recommended)
@@ -105,7 +105,7 @@ If you use the gripper process (same `cd` as above):
 ./bin/gripper-interface config/local-host.yml
 ```
 
-For a two-machine deployment, start from `config/charmander.yml` and set `ROBOT.IP`, `NUC.IP`, and `PC.IP` to the robot, NUC, and desktop addresses, then run the same commands with that file.
+For a two-machine deployment, copy `config/local-host.yml`, set `ROBOT.IP`, `NUC.IP`, and `PC.IP` to the robot, NUC, and desktop addresses, then run the same commands with that file.
 
 ## Quick start
 
@@ -137,7 +137,7 @@ peirastic.get_controller_info
 
 ## Control modes
 
-The current stack exposes the following controller families.
+The stack exposes the following controller families.
 At the API level, they should be understood as target-following modes: the
 target may come from a script, policy, perception module, teleop device, or any
 other upstream source.
@@ -145,17 +145,12 @@ other upstream source.
 ### OSC modes
 
 - `OSC_POSE`
-- `OSC_POSITION`
-- `OSC_YAW`
-
-These controllers use task-space impedance and, by default, simple pose
+This controller uses task-space impedance and, by default, simple pose
 interpolation such as `LINEAR_POSE` rather than `RUCKIG_POSE`.
 
 Default config files:
 
 - `config/osc-pose-controller.yml`
-- `config/osc-position-controller.yml`
-- `config/osc-yaw-controller.yml`
 
 ### Joint-space modes
 
@@ -166,13 +161,12 @@ Default config files:
 
 - `config/joint-position-controller.yml`
 - `config/joint-impedance-controller.yml`
-- `config/compliant-joint-impedance-controller.yml`
 
 ### Cartesian tracking mode
 
 - `CARTESIAN_VELOCITY`
 
-This is the only Cartesian controller type in the current NUC-side stack.
+This is the Cartesian controller type exposed by the NUC-side stack.
 It can be used in two ways:
 
 - direct Cartesian velocity commands
@@ -184,12 +178,12 @@ Default config file:
 
 ### Admittance mode
 
-The standalone admittance mode is currently implemented as a **Python outer
+The standalone admittance mode is implemented as a **Python outer
 loop** with an **OSC inner loop**.
 
 Runtime config file:
 
-- `config/admittance-controller.yml`
+- `config/spacenav-admittance-controller.yml`
 
 ## Joint reset examples
 
@@ -228,7 +222,7 @@ ok = robot.reset_joints("ready")
 print("success:", ok)
 ```
 
-Built-in named joint targets currently include:
+Built-in named joint targets include:
 
 - `ready`
 - `ftcalib_jgroup`
@@ -329,8 +323,6 @@ Main fields:
 Tune here:
 
 - `config/osc-pose-controller.yml`
-- `config/osc-position-controller.yml`
-- `config/osc-yaw-controller.yml`
 
 Main fields:
 
@@ -347,22 +339,20 @@ Tune here:
 
 - `config/joint-position-controller.yml`
 - `config/joint-impedance-controller.yml`
-- `config/compliant-joint-impedance-controller.yml`
 
 ### Admittance
 
-`config/admittance-controller.yml` (consumed by `admittance_target_follow.py`):
+`config/spacenav-admittance-controller.yml` (consumed by `spacenav_mode_switch_test.py`):
 
 - **Link / rate**: `interface_cfg`, `control_freq`
-- **Start pose**: `reset_joints_on_start`, `joint_reset_timeout`, `init_joint_angles`
+- **Start pose**: `init_joint_angles`
 - **NetFT calib file**: `netft_calibration.env_key`, `netft_calibration.default_path`
 - **Tool frame**: `tool.eef_offset`, `tool.eef_offset_rpy`
-- **Command inputs**: `command_input.pose_topic`, `command_input.twist_topic`,
-  `command_input.twist_timeout`, `command_input.linear_scale`,
-  `command_input.angular_scale`
+- **Teleop inputs**: `teleop.linear_scale`, `teleop.angular_scale`, deadzones and override thresholds
 - **Admittance loop** (`admittance` block): `force_target_z`, `mass`, `damping_down`,
   `damping_up`, `force_derivative_gain`, `accel_limit`, `force_deadband`, `force_alpha`,
   `max_admittance_position`, `max_admittance_velocity`, `bias_wait`
+- **Contact switching** (`contact` block): make/break thresholds and release delay
 - **Guards** (`safety` block): `max_position_error`, `max_rotation_error`
 - **OSC inner loop** (`osc` block): `kp_translation`, `kp_rotation`, `residual_mass_vec`,
   `action_scale` (translation / rotation, used by the script as a per-cycle clip),
@@ -384,39 +374,21 @@ instead of this script, or remove the overwrite and set `osc_cfg["Kp"]` yourself
 
 The main standalone implementation is:
 
-- `peirastic/scripts/admittance_target_follow.py`
+- `peirastic/scripts/spacenav_mode_switch_test.py`
 
 It accepts:
 
-- a `PoseStamped` topic for absolute target updates
-- a `Twist` topic for incremental motion commands
+- SpaceNav teleop input from ROS
 - NetFT force input from ROS `/netft_data`
-- calibrated force compensation from `/netft_calib_param`
+- calibrated force compensation from the configured NetFT YAML
+- contact-triggered switching into admittance mode
 - OSC for the inner robot command loop
-
-The legacy experimental script
-`peirastic/scripts/test_spacenav_admittance.py` is SpaceNav-coupled and
-should be treated as a separate prototype.
 
 ### Important behavior note
 
-With the current script, the force controller does **not** wait for contact
-before becoming active. If the force target is non-zero in free space, the
-robot may drift along the tool Z axis while trying to realize that target.
-
-The reason is:
-
-- once NetFT data is available, the script continuously computes force error and
-  updates the admittance state every cycle
-- there is no explicit contact detection or guarded-descent phase in this
-  script
-
-So the current prototype does **not** implement a standalone "search for
-contact and then regulate force" behavior.
-
-A full **non-target** policy (here: **guarded descent** to contact, then
-regulation/retreat) belongs in a separate controller. `admittance_target_follow`
-is topic-following with a simple constant-force overlay, not that stack.
+The script stays in normal teleop until calibrated force crosses the contact
+threshold. In contact, the admittance loop regulates only the tool-Z direction;
+tangential motion and orientation remain controlled by SpaceNav.
 
 ### Calibration file
 
@@ -425,28 +397,14 @@ The script reads the NetFT calibration YAML from:
 - environment variable: `PEIRASTIC_NETFT_CALIB_YAML`
 - otherwise default: `~/.local/share/peirastic/netft/config/netft_calib_result.yaml`
 
-At startup it runs:
-
-- `rosparam load <calibration_yaml>`
-
-and then reads:
-
-- `/netft_calib_param`
-
-The YAML must therefore contain a top-level key named:
-
-- `netft_calib_param`
+The YAML is loaded directly by the Python script; no separate `rosparam load`
+step is required.
 
 ### Runtime configuration
 
 The standalone admittance runtime parameters live in:
 
-- `config/admittance-controller.yml`
-
-The default ROS command topics are:
-
-- `/peirastic/admittance/target_pose`
-- `/peirastic/admittance/target_twist`
+- `config/spacenav-admittance-controller.yml`
 
 ### How to run
 
@@ -455,24 +413,14 @@ Prerequisites:
 - `franka-interface` running
 - `roscore` running
 - `/netft_data` available
-- `rosparam` available in the shell
 - calibration YAML generated
 
-Before running on a same-machine setup, make sure
-`config/admittance-controller.yml` uses:
-
-- `interface_cfg: local-host.yml`
-
-Standalone example:
+Integrated SpaceNav example:
 
 ```bash
-peirastic.admittance_target_follow --controller-cfg admittance-controller.yml
-```
-
-Legacy SpaceNav-based prototype:
-
-```bash
-peirastic.test_spacenav_admittance --controller-cfg spacenav-admittance-controller.yml
+peirastic.spacenav_mode_switch_test \
+  --interface-cfg local-host.yml \
+  --admittance-controller-cfg spacenav-admittance-controller.yml
 ```
 
 ## Dynamic mode switching
@@ -607,16 +555,14 @@ to publish calibrated force results for inspection.
 - `config/local-host.yml`
 - `config/control_config.yml`
 - `config/cartesian-velocity-controller.yml`
-- `config/admittance-controller.yml`
 - `config/osc-pose-controller.yml`
-- `config/osc-position-controller.yml`
-- `config/osc-yaw-controller.yml`
 - `config/joint-position-controller.yml`
 - `config/joint-impedance-controller.yml`
 - `config/spacenav-admittance-controller.yml`
 - `peirastic/franka_interface/franka_interface.py`
-- `peirastic/scripts/admittance_target_follow.py`
 - `peirastic/scripts/spacenav_mode_switch_test.py`
-- `peirastic/scripts/test_spacenav_admittance.py`
+- `peirastic/scripts/spacenav_cartesian_min.py`
 - `peirastic/scripts/netft_data_acquisition.py`
+- `peirastic/scripts/netft_identification.py`
+- `peirastic/scripts/netft_pub_calib_result.py`
 - `peirastic/netft_calib/identification_core.py`

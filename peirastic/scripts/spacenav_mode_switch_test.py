@@ -647,7 +647,10 @@ def main() -> int:
         if admittance_pos is None or admittance_quat is None:
             print("Robot tool pose is unavailable after startup initialization.", file=sys.stderr)
             return 7
-        admittance_start_z = float(admittance_pos[2])
+        admittance_axis_base = transform_utils.quat2mat(admittance_quat)[:, 2].copy()
+        admittance_axis_base /= max(float(np.linalg.norm(admittance_axis_base)), 1e-12)
+        admittance_anchor_normal = float(np.dot(admittance_pos, admittance_axis_base))
+        admittance_offset = 0.0
         admittance_vel = 0.0
         filtered_fz = None
         force_bias = 0.0
@@ -710,7 +713,10 @@ def main() -> int:
                 if tool_pos is not None and tool_quat is not None:
                     admittance_pos = tool_pos.copy()
                     admittance_quat = tool_quat.copy()
-                    admittance_start_z = float(tool_pos[2])
+                    admittance_axis_base = transform_utils.quat2mat(tool_quat)[:, 2].copy()
+                    admittance_axis_base /= max(float(np.linalg.norm(admittance_axis_base)), 1e-12)
+                    admittance_anchor_normal = float(np.dot(admittance_pos, admittance_axis_base))
+                    admittance_offset = 0.0
                     admittance_vel = 0.0
                     break_contact_timer = 0.0
                     current_kp_z = kp_z_free
@@ -751,7 +757,10 @@ def main() -> int:
                     if tool_pos is not None and tool_quat is not None:
                         admittance_pos = tool_pos.copy()
                         admittance_quat = tool_quat.copy()
-                        admittance_start_z = float(tool_pos[2])
+                        admittance_axis_base = transform_utils.quat2mat(tool_quat)[:, 2].copy()
+                        admittance_axis_base /= max(float(np.linalg.norm(admittance_axis_base)), 1e-12)
+                        admittance_anchor_normal = float(np.dot(admittance_pos, admittance_axis_base))
+                        admittance_offset = 0.0
                     admittance_vel = 0.0
                     fz_prev = 0.0
                     is_in_contact = False
@@ -779,7 +788,10 @@ def main() -> int:
                     if tool_pos is not None and tool_quat is not None:
                         admittance_pos = tool_pos.copy()
                         admittance_quat = tool_quat.copy()
-                        admittance_start_z = float(tool_pos[2])
+                        admittance_axis_base = transform_utils.quat2mat(tool_quat)[:, 2].copy()
+                        admittance_axis_base /= max(float(np.linalg.norm(admittance_axis_base)), 1e-12)
+                        admittance_anchor_normal = float(np.dot(admittance_pos, admittance_axis_base))
+                        admittance_offset = 0.0
                         admittance_vel = 0.0
                         is_in_contact = False
                         break_contact_timer = 0.0
@@ -805,7 +817,10 @@ def main() -> int:
                 if tool_pos is not None and tool_quat is not None:
                     admittance_pos = tool_pos.copy()
                     admittance_quat = tool_quat.copy()
-                    admittance_start_z = float(tool_pos[2])
+                    admittance_axis_base = transform_utils.quat2mat(tool_quat)[:, 2].copy()
+                    admittance_axis_base /= max(float(np.linalg.norm(admittance_axis_base)), 1e-12)
+                    admittance_anchor_normal = float(np.dot(admittance_pos, admittance_axis_base))
+                    admittance_offset = 0.0
                     admittance_vel = 0.0
                     is_in_contact = False
                     break_contact_timer = 0.0
@@ -914,32 +929,53 @@ def main() -> int:
 
                 admittance_pos[0] += sn_lin[0] * args.linear_scale * dt
                 admittance_pos[1] += sn_lin[1] * args.linear_scale * dt
-                if not is_in_contact or sn_lin[2] > 0.0:
-                    admittance_pos[2] += sn_lin[2] * args.linear_scale * dt
+                admittance_pos[2] += sn_lin[2] * args.linear_scale * dt
                 admittance_quat = integrate_body_rotation(
                     admittance_quat,
                     np.array([sn_ang[0], -sn_ang[1], -sn_ang[2]], dtype=np.float64)
                     * args.angular_scale,
                     dt,
                 )
+                if not is_in_contact:
+                    admittance_axis_base = transform_utils.quat2mat(admittance_quat)[:, 2].copy()
+                    axis_norm = float(np.linalg.norm(admittance_axis_base))
+                    if axis_norm > 1e-12:
+                        admittance_axis_base /= axis_norm
+                    admittance_anchor_normal = float(
+                        np.dot(admittance_pos, admittance_axis_base)
+                    )
 
                 if have_force and not is_in_contact and fz_comp < contact_make and not user_override:
                     is_in_contact = True
+                    admittance_anchor_normal = float(
+                        np.dot(admittance_pos, admittance_axis_base)
+                    )
+                    admittance_offset = 0.0
+                    admittance_vel = 0.0
                     break_contact_timer = 0.0
                     _info(f"Contact detected: Fz={fz_comp:.3f} N, admittance active.")
                 elif is_in_contact:
                     if user_override:
                         is_in_contact = False
+                        admittance_pos = tool_pos.copy()
+                        admittance_offset = 0.0
+                        admittance_vel = 0.0
                         break_contact_timer = 0.0
                         _info("Contact released by SpaceNav Z override.")
                     elif have_force and fz_comp > contact_break_fast:
                         is_in_contact = False
+                        admittance_pos = tool_pos.copy()
+                        admittance_offset = 0.0
+                        admittance_vel = 0.0
                         break_contact_timer = 0.0
                         _info(f"Contact released: Fz={fz_comp:.3f} N.")
                     elif have_force and fz_comp > contact_break_slow:
                         break_contact_timer += dt
                         if break_contact_timer > contact_break_delay:
                             is_in_contact = False
+                            admittance_pos = tool_pos.copy()
+                            admittance_offset = 0.0
+                            admittance_vel = 0.0
                             break_contact_timer = 0.0
                             _info(f"Contact released after delay: Fz={fz_comp:.3f} N.")
                     else:
@@ -965,7 +1001,9 @@ def main() -> int:
                     admittance_acc = float(np.clip(admittance_acc, -accel_limit, accel_limit))
                 else:
                     target_kp_z = kp_z_free
-                    admittance_acc = (-(200.0 + damping_down) * admittance_vel) / admittance_mass
+                    admittance_acc = 0.0
+                    admittance_vel = 0.0
+                    admittance_offset = 0.0
                     admittance_acc = float(np.clip(admittance_acc, -accel_limit, accel_limit))
 
                 admittance_vel += admittance_acc * dt
@@ -973,16 +1011,26 @@ def main() -> int:
                     np.clip(admittance_vel, -max_admittance_velocity, max_admittance_velocity)
                 )
 
-                tool_z_base = transform_utils.quat2mat(tool_quat)[:, 2]
-                admittance_pos += admittance_vel * tool_z_base * dt
-                z_displacement = float(
+                admittance_offset += admittance_vel * dt
+                admittance_offset = float(
                     np.clip(
-                        admittance_pos[2] - admittance_start_z,
+                        admittance_offset,
                         -max_admittance_position,
                         max_admittance_position,
                     )
                 )
-                admittance_pos[2] = admittance_start_z + z_displacement
+                if is_in_contact:
+                    nominal_normal = float(np.dot(admittance_pos, admittance_axis_base))
+                    tangent_target = (
+                        admittance_pos - nominal_normal * admittance_axis_base
+                    )
+                    commanded_admittance_pos = (
+                        tangent_target
+                        + (admittance_anchor_normal + admittance_offset)
+                        * admittance_axis_base
+                    )
+                else:
+                    commanded_admittance_pos = admittance_pos.copy()
 
                 current_kp_z = (1.0 - kp_z_alpha) * current_kp_z + kp_z_alpha * target_kp_z
                 admittance_cfg["Kp"]["translation"] = [
@@ -991,19 +1039,27 @@ def main() -> int:
                     float(current_kp_z),
                 ]
 
-                pos_error = admittance_pos - tool_pos
+                pos_error = commanded_admittance_pos - tool_pos
                 if is_in_contact:
-                    xy_norm = float(np.linalg.norm(pos_error[:2]))
-                    if xy_norm > max_position_error:
-                        admittance_pos[:2] = (
-                            tool_pos[:2] + pos_error[:2] * (max_position_error / xy_norm)
+                    normal_component = (
+                        float(np.dot(pos_error, admittance_axis_base))
+                        * admittance_axis_base
+                    )
+                    tangent_component = pos_error - normal_component
+                    tangent_norm = float(np.linalg.norm(tangent_component))
+                    if tangent_norm > max_position_error:
+                        tangent_component *= max_position_error / tangent_norm
+                        commanded_admittance_pos = (
+                            tool_pos + tangent_component + normal_component
                         )
-                        pos_error = admittance_pos - tool_pos
+                        pos_error = commanded_admittance_pos - tool_pos
                 else:
                     pos_norm = float(np.linalg.norm(pos_error))
                     if pos_norm > max_position_error:
-                        admittance_pos = tool_pos + pos_error * (max_position_error / pos_norm)
-                        pos_error = admittance_pos - tool_pos
+                        commanded_admittance_pos = (
+                            tool_pos + pos_error * (max_position_error / pos_norm)
+                        )
+                        pos_error = commanded_admittance_pos - tool_pos
 
                 delta_quat = transform_utils.quat_distance(
                     canonicalize_quaternion(admittance_quat, reference_quat_xyzw=tool_quat),
@@ -1036,7 +1092,7 @@ def main() -> int:
                         f"target_fz={force_target_z:.3f}N "
                         f"f_err={admittance_f_error:.3f}N "
                         f"adm_vel={admittance_vel:.4f}m/s "
-                        f"adm_z={admittance_pos[2] - admittance_start_z:.4f}m "
+                        f"adm_z={admittance_offset:.4f}m "
                         f"action_z={admittance_action_z:.4f}m "
                         f"kp_z={current_kp_z:.1f}"
                     )

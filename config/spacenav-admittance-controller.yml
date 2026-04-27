@@ -61,5 +61,5 @@ osc:
     alpha_eef_vel: 0.99
   kp_z:
     free_space: 800.0
-    contact: 50.0
+    contact: 20.0
     smoothing_alpha: 0.05
