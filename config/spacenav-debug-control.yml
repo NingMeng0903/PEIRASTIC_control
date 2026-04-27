@@ -1,0 +1,10 @@
+CONTROL:
+        SAFETY:
+                MAX_TORQUE: 10
+                MIN_TORQUE: -10
+                MAX_TRANS_SPEED: 0.16
+                MIN_TRANS_SPEED: -0.16
+                MAX_ROT_SPEED: 0.35
+                MIN_ROT_SPEED: -0.35
+        # Keep the controller alive between SpaceNav mode switches and client restarts.
+        ZMQ_IDLE_TERMINATE_STEPS: 0

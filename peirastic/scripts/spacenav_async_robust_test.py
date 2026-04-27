@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SpaceNav teleop with runtime switching between Cartesian tracking and OSC."""
+"""SpaceNav async jump robustness test for Cartesian tracking and OSC."""
 
 import argparse
 import os
@@ -13,21 +13,21 @@ from typing import List
 import numpy as np
 import rosgraph
 import rospy
-from geometry_msgs.msg import Twist, WrenchStamped
+from geometry_msgs.msg import PoseStamped, Twist, WrenchStamped
 from sensor_msgs.msg import Joy
 
 from peirastic import ROOT_PATH, config_root
 from peirastic.franka_interface import FrankaInterface
-from peirastic.utils.config_utils import get_default_controller_config, verify_controller_config
+from peirastic.utils import transform_utils
 from peirastic.utils.admittance_utils import (
     calibrate_tool_z_force,
-    canonicalize_quaternion,
+    canonicalize_quaternion as _canonicalize_tool_quaternion,
     ft_sensor_frame,
     integrate_body_rotation,
     load_netft_calib_param,
 )
+from peirastic.utils.config_utils import get_default_controller_config, verify_controller_config
 from peirastic.utils.runtime_paths import get_default_netft_calib_yaml
-from peirastic.utils import transform_utils
 from peirastic.utils.yaml_config import YamlConfig
 
 INIT_JOINT_ANGLES = [0.0, 0.0, 0.0, -1.8, 0.0, 1.8, 0.0]
@@ -96,10 +96,9 @@ def _resolve_config_path(cfg_name: str) -> str:
 
 def _load_controller_cfg(controller_type: str, cfg_path: str):
     if cfg_path:
-        cfg = verify_controller_config(YamlConfig(_resolve_config_path(cfg_path)).as_easydict())
-    else:
-        cfg = get_default_controller_config(controller_type)
-    return cfg
+        cfg = YamlConfig(_resolve_config_path(cfg_path)).as_easydict()
+        return verify_controller_config(cfg)
+    return get_default_controller_config(controller_type)
 
 
 def _existing_franka_interface_processes() -> List[str]:
@@ -186,7 +185,8 @@ def _integrate_absolute_target(
     next_quat = np.asarray(target_quat, dtype=np.float64).copy()
 
     next_pos += sn_lin * linear_scale * dt
-    drot = np.array([sn_ang[0], -sn_ang[1], -sn_ang[2]], dtype=np.float64) * angular_scale * dt
+    drot = np.array([sn_ang[0], -sn_ang[1], -sn_ang[2]], dtype=np.float64)
+    drot *= angular_scale * dt
     if np.linalg.norm(drot) > 0.0:
         delta_quat = transform_utils.axisangle2quat(drot)
         next_quat = transform_utils.quat_multiply(next_quat, delta_quat).astype(np.float64)
@@ -195,16 +195,16 @@ def _integrate_absolute_target(
     return next_pos, next_quat
 
 
-def _build_absolute_action(target_pos, target_quat):
-    canonical_quat = _canonicalize_quaternion(target_quat)
-    return np.concatenate([np.asarray(target_pos, dtype=np.float64), canonical_quat, [-1.0]])
-
-
 def _clip_vector_norm(vec: np.ndarray, max_norm: float) -> np.ndarray:
     norm = np.linalg.norm(vec)
     if max_norm <= 0.0 or norm <= max_norm or norm <= 1e-12:
         return vec
     return vec * (max_norm / norm)
+
+
+def _build_absolute_action(target_pos, target_quat):
+    canonical_quat = _canonicalize_quaternion(target_quat)
+    return np.concatenate([np.asarray(target_pos, dtype=np.float64), canonical_quat, [-1.0]])
 
 
 def _build_osc_delta_action(
@@ -233,45 +233,6 @@ def _build_osc_delta_action(
     return np.concatenate([delta_pos, delta_rot, [-1.0]])
 
 
-def _step_command_target(
-    command_pos: np.ndarray,
-    command_quat: np.ndarray,
-    desired_pos: np.ndarray,
-    desired_quat: np.ndarray,
-    max_pos_step: float,
-    max_rot_step: float,
-):
-    next_pos = command_pos + _clip_vector_norm(desired_pos - command_pos, max_pos_step)
-
-    desired_quat = _canonicalize_quaternion(desired_quat, reference_quat=command_quat)
-    delta_quat = transform_utils.quat_distance(desired_quat, command_quat).astype(np.float64)
-    delta_quat = _canonicalize_quaternion(delta_quat)
-    delta_rot = transform_utils.quat2axisangle(delta_quat).astype(np.float64)
-    delta_angle = float(np.linalg.norm(delta_rot))
-    if max_rot_step <= 0.0 or delta_angle <= max_rot_step or delta_angle <= 1e-12:
-        next_quat = desired_quat
-    else:
-        step_fraction = max_rot_step / delta_angle
-        next_quat = transform_utils.quat_slerp(
-            command_quat.astype(np.float64),
-            desired_quat.astype(np.float64),
-            step_fraction,
-        ).astype(np.float64)
-        next_quat = _canonicalize_quaternion(next_quat, reference_quat=command_quat)
-
-    pos_error = float(np.linalg.norm(desired_pos - next_pos))
-    rot_error = float(
-        np.linalg.norm(
-            transform_utils.quat2axisangle(
-                _canonicalize_quaternion(
-                    transform_utils.quat_distance(desired_quat, next_quat).astype(np.float64)
-                )
-            ).astype(np.float64)
-        )
-    )
-    return next_pos, next_quat, pos_error, rot_error
-
-
 def _capture_pose_target(robot: FrankaInterface):
     current_pose = robot.last_eef_pose
     if current_pose is None:
@@ -283,6 +244,19 @@ def _capture_pose_target(robot: FrankaInterface):
     return target_pos, target_quat
 
 
+def _pose_error(current_pose: np.ndarray, target_pos: np.ndarray, target_quat: np.ndarray):
+    current_pos = current_pose[:3, 3].astype(np.float64).copy()
+    current_quat = _canonicalize_quaternion(
+        transform_utils.mat2quat(current_pose[:3, :3]).astype(np.float64).copy()
+    )
+    delta_quat = transform_utils.quat_distance(
+        _canonicalize_quaternion(target_quat, reference_quat=current_quat),
+        current_quat,
+    ).astype(np.float64)
+    delta_rot = transform_utils.quat2axisangle(_canonicalize_quaternion(delta_quat))
+    return float(np.linalg.norm(target_pos - current_pos)), float(np.linalg.norm(delta_rot))
+
+
 def _current_tool_pose(robot: FrankaInterface, eef_offset: np.ndarray, eef_offset_rot: np.ndarray):
     current_pose = robot.last_eef_pose
     if current_pose is None:
@@ -292,7 +266,9 @@ def _current_tool_pose(robot: FrankaInterface, eef_offset: np.ndarray, eef_offse
     link8_pos = current_pose[:3, 3].astype(np.float64).copy()
     tool_pos = link8_pos + link8_rot @ eef_offset
     tool_rot = link8_rot @ eef_offset_rot
-    tool_quat = canonicalize_quaternion(transform_utils.mat2quat(tool_rot).astype(np.float64))
+    tool_quat = _canonicalize_tool_quaternion(
+        transform_utils.mat2quat(tool_rot).astype(np.float64)
+    )
     return tool_pos.astype(np.float64), tool_quat, link8_rot
 
 
@@ -327,65 +303,8 @@ def _load_netft_calibration(calib_yaml: str):
     calib_yaml = os.path.abspath(os.path.expanduser(calib_yaml))
     if not os.path.isfile(calib_yaml):
         raise FileNotFoundError(f"Calibration file not found: {calib_yaml}")
-
-    cfg = YamlConfig(calib_yaml).as_easydict()
-    calib_param = cfg.netft_calib_param if "netft_calib_param" in cfg else cfg
-    return load_netft_calib_param(calib_param)
-
-
-def _capture_admittance_force_bias(
-    robot: FrankaInterface,
-    controller_cfg,
-    eef_offset: np.ndarray,
-    eef_offset_rot: np.ndarray,
-    calib_params,
-    sensor_rot_z_rad: float,
-    sensor_tz: float,
-    ftf: np.ndarray,
-    alpha_force: float,
-    bias_wait: float,
-    control_freq: float,
-):
-    hold_action = np.concatenate([np.zeros(6, dtype=np.float64), [-1.0]])
-    for _ in range(30):
-        robot.control("OSC_POSE", hold_action, controller_cfg=controller_cfg)
-        time.sleep(0.02)
-
-    force_samples = []
-    filtered_fz = None
-    dt = 1.0 / control_freq
-    deadline = time.monotonic() + max(0.0, bias_wait)
-    while time.monotonic() < deadline and not rospy.is_shutdown():
-        _, _, link8_rot = _current_tool_pose(robot, eef_offset, eef_offset_rot)
-        with _lock:
-            raw_ft = _raw_ft.copy()
-            have_force = _force_ready
-        if have_force and link8_rot is not None:
-            link8_rpy = transform_utils.mat2euler(link8_rot, axes="sxyz")
-            sensor_rpy = ft_sensor_frame(link8_rpy, sensor_rot_z_rad, sensor_tz)
-            fz_cal = calibrate_tool_z_force(raw_ft, sensor_rpy, calib_params, ftf)
-            filtered_fz = (
-                fz_cal if filtered_fz is None else alpha_force * filtered_fz + (1.0 - alpha_force) * fz_cal
-            )
-            force_samples.append(fz_cal)
-        robot.control("OSC_POSE", hold_action, controller_cfg=controller_cfg)
-        time.sleep(dt)
-
-    if not force_samples:
-        return 0.0, 0.0, 0
-    force_bias = float(np.mean(force_samples))
-    return force_bias, force_bias, len(force_samples)
-
-
-def _wait_for_force_data(timeout: float) -> bool:
-    deadline = time.monotonic() + max(0.0, timeout)
-    while time.monotonic() < deadline and not rospy.is_shutdown():
-        with _lock:
-            if _force_ready:
-                return True
-        time.sleep(0.02)
-    with _lock:
-        return bool(_force_ready)
+    subprocess.run(["rosparam", "load", calib_yaml], check=True)
+    return load_netft_calib_param(rospy.get_param("/netft_calib_param"))
 
 
 def _poll_spacenav_state():
@@ -409,6 +328,59 @@ def _capture_spacenav_bias():
     return _sn_lin_bias.copy(), _sn_ang_bias.copy()
 
 
+def _publish_target(pub, frame_id: str, target_pos: np.ndarray, target_quat: np.ndarray):
+    if pub is None:
+        return
+    msg = PoseStamped()
+    msg.header.stamp = rospy.Time.now()
+    msg.header.frame_id = frame_id
+    msg.pose.position.x = float(target_pos[0])
+    msg.pose.position.y = float(target_pos[1])
+    msg.pose.position.z = float(target_pos[2])
+    quat = _canonicalize_quaternion(target_quat)
+    msg.pose.orientation.x = float(quat[0])
+    msg.pose.orientation.y = float(quat[1])
+    msg.pose.orientation.z = float(quat[2])
+    msg.pose.orientation.w = float(quat[3])
+    pub.publish(msg)
+
+
+def _reset_target_to_origin(origin_pos: np.ndarray, origin_quat: np.ndarray):
+    return origin_pos.copy(), origin_quat.copy()
+
+
+def _prepare_handoff(robot: FrankaInterface, hard_reset: bool = False) -> None:
+    robot.bump_control_session()
+    if hard_reset:
+        robot.request_session_hard_reset()
+    robot.reset_control_rate_limiter()
+    robot.force_next_control_preprocess()
+
+
+def _wait_until_stationary(
+    robot: FrankaInterface,
+    timeout: float,
+    max_joint_speed: float,
+    stable_cycles: int,
+    poll_interval: float,
+) -> bool:
+    if timeout <= 0.0:
+        return True
+
+    deadline = time.monotonic() + timeout
+    stable_count = 0
+    while time.monotonic() < deadline and not rospy.is_shutdown():
+        dq = robot.last_dq
+        if dq is not None and float(np.max(np.abs(dq))) <= max_joint_speed:
+            stable_count += 1
+            if stable_count >= stable_cycles:
+                return True
+        else:
+            stable_count = 0
+        time.sleep(poll_interval)
+    return False
+
+
 def _parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--interface-cfg", default="local-host.yml")
@@ -422,20 +394,15 @@ def _parse_args():
     parser.add_argument(
         "--netft-calib-yaml",
         default=os.environ.get("PEIRASTIC_NETFT_CALIB_YAML", get_default_netft_calib_yaml()),
-        help="NetFT calibration YAML read directly by this script.",
+        help="NetFT calibration YAML loaded into /netft_calib_param.",
     )
+    parser.add_argument("--control-freq", type=float, default=100.0)
     parser.add_argument(
-        "--netft-topic",
-        default="/netft_data",
-        help="Raw NetFT WrenchStamped topic. This script calibrates the raw wrench inline.",
+        "--send-every-n",
+        type=int,
+        default=1,
+        help="Send one robot command every N script cycles; default is every 100Hz cycle.",
     )
-    parser.add_argument(
-        "--force-wait-timeout",
-        type=float,
-        default=3.0,
-        help="Seconds to wait for NetFT data before enabling admittance mode.",
-    )
-    parser.add_argument("--control-freq", type=float, default=250.0)
     parser.add_argument("--linear-scale", type=float, default=0.08)
     parser.add_argument("--angular-scale", type=float, default=0.18)
     parser.add_argument("--traj-time-fraction", type=float, default=0.4)
@@ -444,11 +411,20 @@ def _parse_args():
     parser.add_argument("--spacenav-timeout", type=float, default=5.0)
     parser.add_argument("--state-timeout", type=float, default=30.0)
     parser.add_argument("--init-timeout", type=float, default=120.0)
-    parser.add_argument("--reset-on-start", action="store_true")
+    parser.add_argument("--joint-position-tolerance", type=float, default=2e-3)
+    parser.add_argument("--handoff-stationary-timeout", type=float, default=3.0)
+    parser.add_argument("--stationary-joint-speed", type=float, default=0.01)
+    parser.add_argument("--stationary-cycles", type=int, default=5)
+    parser.add_argument("--origin-joints", type=float, nargs=7, default=INIT_JOINT_ANGLES)
+    parser.add_argument(
+        "--reset-on-start",
+        action="store_true",
+        help="Physically move to --origin-joints before starting. Default is current pose.",
+    )
     parser.add_argument(
         "--button1-reset-origin",
         action="store_true",
-        help="Make SpaceNav button1 physically reset to INIT_JOINT_ANGLES.",
+        help="Make SpaceNav button1 physically reset to --origin-joints.",
     )
     parser.add_argument("--launch-controller", action="store_true")
     parser.add_argument(
@@ -465,46 +441,30 @@ def _parse_args():
     parser.add_argument("--terminate-at-exit", action="store_true")
     parser.add_argument("--max-steps", type=int, default=0)
     parser.add_argument(
-        "--command-max-pos-step",
-        type=float,
-        default=0.008,
-        help="Shared per-cycle desired->command translation step in meters.",
-    )
-    parser.add_argument(
-        "--command-max-rot-step",
-        type=float,
-        default=0.08,
-        help="Shared per-cycle desired->command rotation step in radians.",
-    )
-    parser.add_argument(
         "--osc-max-pos-delta",
         type=float,
         default=0.010,
-        help="Per-cycle OSC delta translation clip in meters.",
+        help="Per-command OSC delta translation clip in meters.",
     )
     parser.add_argument(
         "--osc-max-rot-delta",
         type=float,
         default=0.08,
-        help="Per-cycle OSC delta rotation clip in radians.",
+        help="Per-command OSC delta rotation clip in radians.",
     )
+    parser.add_argument("--osc-translation-stiffness", type=float, default=700.0)
+    parser.add_argument("--osc-rotation-stiffness", type=float, default=500.0)
     parser.add_argument(
-        "--osc-translation-stiffness",
-        type=float,
-        default=700.0,
-        help="Per-axis OSC translational stiffness used by this safety test script.",
+        "--target-pose-topic",
+        default="/peirastic/async_robust/target_pose",
+        help="Publishes the integrated target pose; set empty string to disable.",
     )
-    parser.add_argument(
-        "--osc-rotation-stiffness",
-        type=float,
-        default=500.0,
-        help="Per-axis OSC rotational stiffness used by this safety test script.",
-    )
+    parser.add_argument("--target-frame", default="panda_link0")
     parser.add_argument(
         "--admittance-debug-interval",
         type=float,
         default=0.25,
-        help="Seconds between admittance debug prints; set <=0 to disable.",
+        help="Seconds between Python-side admittance debug prints; set <=0 to disable.",
     )
     parser.add_argument("--debug-input", action="store_true")
     return parser.parse_args()
@@ -514,12 +474,23 @@ def _info(message: str) -> None:
     print(message, flush=True)
 
 
+def _print_joint_reset_progress(max_position_error: float, max_joint_speed: float) -> None:
+    _info(
+        "Joint reset progress: "
+        f"max_q_err={max_position_error:.5f} "
+        f"max_dq={max_joint_speed:.5f}"
+    )
+
+
 def main() -> int:
     args = _parse_args()
     interface_cfg = _resolve_config_path(args.interface_cfg)
     control_cfg = _resolve_config_path(args.control_cfg) if args.control_cfg else ""
+    send_every_n = max(1, int(args.send_every_n))
 
-    cartesian_cfg = _load_controller_cfg("CARTESIAN_VELOCITY", args.cartesian_controller_cfg)
+    cartesian_cfg = _load_controller_cfg(
+        "CARTESIAN_VELOCITY", args.cartesian_controller_cfg
+    )
     cartesian_cfg["is_delta"] = False
     cartesian_cfg["traj_interpolator_cfg"]["time_fraction"] = max(
         0.1, float(args.traj_time_fraction)
@@ -565,14 +536,19 @@ def main() -> int:
 
     _info("Checking ROS master...")
     if not rosgraph.is_master_online():
-        print("ROS master is not reachable. Start roscore first.", file=sys.stderr, flush=True)
+        print("ROS master is not reachable. Start roscore first.", file=sys.stderr)
         return 1
 
     _info("Connecting to ROS node...")
-    rospy.init_node("spacenav_mode_switch_test", anonymous=False)
+    rospy.init_node("spacenav_async_robust_test", anonymous=False)
     rospy.Subscriber("/spacenav/twist", Twist, _twist_cb, queue_size=1)
     rospy.Subscriber("/spacenav/joy", Joy, _joy_cb, queue_size=1)
-    rospy.Subscriber(args.netft_topic, WrenchStamped, _netft_cb, queue_size=1, tcp_nodelay=True)
+    rospy.Subscriber("/netft_data", WrenchStamped, _netft_cb, queue_size=1, tcp_nodelay=True)
+    target_pub = (
+        rospy.Publisher(args.target_pose_topic, PoseStamped, queue_size=1)
+        if args.target_pose_topic
+        else None
+    )
 
     try:
         calib_params, sensor_rot_z_rad, sensor_tz, ftf = _load_netft_calibration(
@@ -586,7 +562,7 @@ def main() -> int:
         _info("Waiting for /spacenav/twist messages...")
         rospy.wait_for_message("/spacenav/twist", Twist, timeout=args.spacenav_timeout)
     except rospy.ROSException:
-        print("Timeout: no /spacenav/twist messages. Start roscore and spacenav_node first.", file=sys.stderr)
+        print("Timeout: no /spacenav/twist messages.", file=sys.stderr)
         return 3
 
     if args.launch_controller:
@@ -614,99 +590,156 @@ def main() -> int:
 
     active_mode = MODE_CARTESIAN
     steps = 0
+    loop_idx = 0
     last_debug_time = 0.0
     last_admittance_debug_time = 0.0
     force_send = True
-    dt = 1.0 / args.control_freq
+    origin_pos = None
+    origin_quat = None
+    desired_pos = None
+    desired_quat = None
+    admittance_pos = None
+    admittance_quat = None
+    admittance_start_z = 0.0
+    admittance_vel = 0.0
+    filtered_fz = 0.0
+    force_bias = 0.0
+    fz_prev = 0.0
+    fz_comp = 0.0
+    is_in_contact = False
+    break_contact_timer = 0.0
+    current_kp_z = kp_z_free
 
     try:
         _info("Waiting for robot state...")
         if not robot.wait_for_state(timeout=args.state_timeout):
-            print("Timeout: no robot state from local franka-interface.", file=sys.stderr)
+            print("Timeout: no robot state from franka-interface.", file=sys.stderr)
             return 4
 
         if args.reset_on_start:
-            _info("Resetting robot to INIT_JOINT_ANGLES...")
-            if not robot.move_joints(INIT_JOINT_ANGLES, timeout=args.init_timeout):
-                print("Failed to reach INIT_JOINT_ANGLES.", file=sys.stderr)
+            _info("Waiting for robot to become stationary before origin reset...")
+            if not _wait_until_stationary(
+                robot,
+                args.handoff_stationary_timeout,
+                args.stationary_joint_speed,
+                args.stationary_cycles,
+                1.0 / args.control_freq,
+            ):
+                print("Robot did not become stationary before origin reset.", file=sys.stderr)
                 return 5
-        else:
-            _info("Skipping startup joint reset; using current robot pose as teleop reference.")
 
-        bias_lin, bias_ang = _capture_spacenav_bias()
-        desired_pos, desired_quat = _capture_pose_target(robot)
-        if desired_pos is None or desired_quat is None:
-            print("Robot pose is unavailable after startup initialization.", file=sys.stderr, flush=True)
-            return 6
-        command_pos = desired_pos.copy()
-        command_quat = desired_quat.copy()
+            _info("Resetting robot to origin joints...")
+            if not robot.move_joints(
+                args.origin_joints,
+                timeout=args.init_timeout,
+                position_tolerance=args.joint_position_tolerance,
+                shutdown_check=rospy.is_shutdown,
+                progress_interval=0.5 if args.debug_input else 0.0,
+                progress_callback=_print_joint_reset_progress,
+            ):
+                print("Failed to reach origin joints.", file=sys.stderr)
+                return 6
+            if not _wait_until_stationary(
+                robot,
+                args.handoff_stationary_timeout,
+                args.stationary_joint_speed,
+                args.stationary_cycles,
+                1.0 / args.control_freq,
+            ):
+                print("Robot did not become stationary after origin reset.", file=sys.stderr)
+                return 7
+        else:
+            _info("Skipping origin reset; using current robot pose as start reference.")
+
+        origin_pos, origin_quat = _capture_pose_target(robot)
+        if origin_pos is None or origin_quat is None:
+            print("Robot pose is unavailable after startup.", file=sys.stderr)
+            return 8
+        desired_pos, desired_quat = _reset_target_to_origin(origin_pos, origin_quat)
+        _publish_target(target_pub, args.target_frame, desired_pos, desired_quat)
+        force_send = False
+        _prepare_handoff(robot, hard_reset=True)
 
         admittance_pos, admittance_quat, _ = _current_tool_pose(
             robot, eef_offset, eef_offset_rot
         )
         if admittance_pos is None or admittance_quat is None:
-            print("Robot tool pose is unavailable after startup initialization.", file=sys.stderr)
-            return 7
+            print("Robot tool pose is unavailable after startup.", file=sys.stderr)
+            return 9
         admittance_start_z = float(admittance_pos[2])
-        admittance_vel = 0.0
-        filtered_fz = None
-        force_bias = 0.0
-        fz_prev = 0.0
-        is_in_contact = False
-        break_contact_timer = 0.0
-        current_kp_z = kp_z_free
 
-        force_bias, filtered_fz, force_sample_count = _capture_admittance_force_bias(
-            robot,
-            admittance_cfg,
-            eef_offset,
-            eef_offset_rot,
-            calib_params,
-            sensor_rot_z_rad,
-            sensor_tz,
-            ftf,
-            force_alpha,
-            bias_wait,
-            args.control_freq,
-        )
-        if force_sample_count > 0:
-            _info(
-                f"NetFT force bias captured: Fz={force_bias:.3f} N "
-                f"from {force_sample_count} samples."
-            )
+        force_samples = []
+        bias_deadline = time.monotonic() + max(0.0, bias_wait)
+        while time.monotonic() < bias_deadline and not rospy.is_shutdown():
+            _, _, link8_rot = _current_tool_pose(robot, eef_offset, eef_offset_rot)
+            with _lock:
+                raw_ft = _raw_ft.copy()
+                have_force = _force_ready
+            if have_force and link8_rot is not None:
+                link8_rpy = transform_utils.mat2euler(link8_rot, axes="sxyz")
+                sensor_rpy = ft_sensor_frame(link8_rpy, sensor_rot_z_rad, sensor_tz)
+                force_samples.append(
+                    calibrate_tool_z_force(raw_ft, sensor_rpy, calib_params, ftf)
+                )
+            time.sleep(1.0 / args.control_freq)
+        if force_samples:
+            force_bias = float(np.mean(force_samples))
+            filtered_fz = force_bias
+            fz_prev = 0.0
+            _info(f"NetFT force bias captured: Fz={force_bias:.3f} N.")
         else:
-            _info(
-                f"No samples on {args.netft_topic} during bias capture; "
-                "admittance mode waits for force data."
-            )
+            filtered_fz = 0.0
+            _info("No /netft_data samples during bias capture; admittance mode waits for force data.")
 
+        bias_lin, bias_ang = _capture_spacenav_bias()
         _info(
-            "Captured SpaceNav neutral bias: "
-            f"lin={np.round(bias_lin, 6).tolist()} ang={np.round(bias_ang, 6).tolist()}"
+            "Captured start target and SpaceNav neutral bias: "
+            f"start_pos={np.round(origin_pos, 4).tolist()} "
+            f"lin_bias={np.round(bias_lin, 6).tolist()} "
+            f"ang_bias={np.round(bias_ang, 6).tolist()}"
         )
         _info(
             "Ready: button0 cycles CARTESIAN_TRACKING/OSC_POSE/ADMITTANCE; "
             "button1 re-anchors current pose unless --button1-reset-origin is set."
         )
 
+        last_loop_time = time.monotonic()
         rate = rospy.Rate(args.control_freq)
 
         while not rospy.is_shutdown():
+            loop_start = time.monotonic()
+            dt = max(0.0, min(loop_start - last_loop_time, 0.1))
+            last_loop_time = loop_start
+            sent_command = False
+
             sn_lin, sn_ang, do_reset, do_toggle, last_twist_time = _poll_spacenav_state()
             raw_sn_lin = sn_lin - _sn_lin_bias
             raw_sn_ang = sn_ang - _sn_ang_bias
             sn_lin = raw_sn_lin.copy()
             sn_ang = raw_sn_ang.copy()
 
+            now = time.monotonic()
+            if last_twist_time <= 0.0 or now - last_twist_time > args.spacenav_timeout:
+                sn_lin[:] = 0.0
+                sn_ang[:] = 0.0
+
             if do_toggle:
+                if not _wait_until_stationary(
+                    robot,
+                    args.handoff_stationary_timeout,
+                    args.stationary_joint_speed,
+                    args.stationary_cycles,
+                    1.0 / args.control_freq,
+                ):
+                    _info("Mode switch skipped: robot is still moving.")
+                    rate.sleep()
+                    continue
                 active_mode = MODES[(MODES.index(active_mode) + 1) % len(MODES)]
                 current_pos, current_quat = _capture_pose_target(robot)
                 tool_pos, tool_quat, _ = _current_tool_pose(robot, eef_offset, eef_offset_rot)
                 if current_pos is not None and current_quat is not None:
                     desired_pos = current_pos.copy()
                     desired_quat = current_quat.copy()
-                    command_pos = current_pos.copy()
-                    command_quat = current_quat.copy()
                 if tool_pos is not None and tool_quat is not None:
                     admittance_pos = tool_pos.copy()
                     admittance_quat = tool_quat.copy()
@@ -714,68 +747,22 @@ def main() -> int:
                     admittance_vel = 0.0
                     break_contact_timer = 0.0
                     current_kp_z = kp_z_free
-                robot.bump_control_session()
-                # Ensure the next target controller message is not dropped by policy-rate
-                # throttling right after a bursty mode switch, and re-run the NO_CONTROL
-                # handshake the next time controller_type actually changes in control().
-                robot.reset_control_rate_limiter()
-                robot.force_next_control_preprocess()
-                if active_mode == MODE_ADMITTANCE:
-                    if not _wait_for_force_data(args.force_wait_timeout):
-                        _info(
-                            "Admittance mode needs force data, but no WrenchStamped messages "
-                            f"arrived on {args.netft_topic}. Start netft_utils/netft_node "
-                            "so it publishes /netft_data, then switch to ADMITTANCE again."
-                        )
-                        active_mode = MODE_OSC
-                        force_send = True
-                        _info("Switched back to OSC_POSE because NetFT data is unavailable.")
-                        continue
-                    _info("Initializing admittance mode: holding current pose and capturing force bias.")
-                    force_bias, filtered_fz, force_sample_count = _capture_admittance_force_bias(
-                        robot,
-                        admittance_cfg,
-                        eef_offset,
-                        eef_offset_rot,
-                        calib_params,
-                        sensor_rot_z_rad,
-                        sensor_tz,
-                        ftf,
-                        force_alpha,
-                        bias_wait,
-                        args.control_freq,
-                    )
-                    tool_pos, tool_quat, _ = _current_tool_pose(
-                        robot, eef_offset, eef_offset_rot
-                    )
-                    if tool_pos is not None and tool_quat is not None:
-                        admittance_pos = tool_pos.copy()
-                        admittance_quat = tool_quat.copy()
-                        admittance_start_z = float(tool_pos[2])
-                    admittance_vel = 0.0
-                    fz_prev = 0.0
-                    is_in_contact = False
-                    break_contact_timer = 0.0
-                    current_kp_z = kp_z_free
-                    _info(
-                        "Admittance initialized: "
-                        f"target_fz={force_target_z:.3f}N "
-                        f"bias_fz={force_bias:.3f}N "
-                        f"samples={force_sample_count} "
-                        f"make_threshold={contact_make:.3f}N."
-                    )
+                _prepare_handoff(robot, hard_reset=True)
                 force_send = True
-                _info(f"Switched control mode to {active_mode}.")
+                loop_idx = 0
+                _info(f"Switched to {active_mode}; continuing from current pose.")
 
             if do_reset:
                 if not args.button1_reset_origin:
-                    desired_pos, desired_quat = _capture_pose_target(robot)
-                    if desired_pos is None or desired_quat is None:
-                        print("Robot pose is unavailable for re-anchor.", file=sys.stderr)
-                        return 8
-                    command_pos = desired_pos.copy()
-                    command_quat = desired_quat.copy()
+                    current_pos, current_quat = _capture_pose_target(robot)
                     tool_pos, tool_quat, _ = _current_tool_pose(robot, eef_offset, eef_offset_rot)
+                    if current_pos is None or current_quat is None:
+                        print("Robot pose is unavailable for re-anchor.", file=sys.stderr)
+                        return 9
+                    desired_pos = current_pos.copy()
+                    desired_quat = current_quat.copy()
+                    origin_pos = current_pos.copy()
+                    origin_quat = current_quat.copy()
                     if tool_pos is not None and tool_quat is not None:
                         admittance_pos = tool_pos.copy()
                         admittance_quat = tool_quat.copy()
@@ -784,23 +771,48 @@ def main() -> int:
                         is_in_contact = False
                         break_contact_timer = 0.0
                         current_kp_z = kp_z_free
-                    robot.bump_control_session()
-                    robot.reset_control_rate_limiter()
-                    robot.force_next_control_preprocess()
+                    _prepare_handoff(robot, hard_reset=True)
                     force_send = True
-                    _info("Re-anchored target to current pose; no joint reset.")
+                    loop_idx = 0
+                    _info("Re-anchored target to current pose; no origin reset.")
                     rate.sleep()
                     continue
 
-                if not robot.move_joints(INIT_JOINT_ANGLES, timeout=args.init_timeout):
-                    print("Failed to reset to INIT_JOINT_ANGLES.", file=sys.stderr)
-                    return 7
-                desired_pos, desired_quat = _capture_pose_target(robot)
-                if desired_pos is None or desired_quat is None:
+                if not _wait_until_stationary(
+                    robot,
+                    args.handoff_stationary_timeout,
+                    args.stationary_joint_speed,
+                    args.stationary_cycles,
+                    1.0 / args.control_freq,
+                ):
+                    _info("Joint reset skipped: robot is still moving.")
+                    rate.sleep()
+                    continue
+                _prepare_handoff(robot)
+                if not robot.move_joints(
+                    args.origin_joints,
+                    timeout=args.init_timeout,
+                    position_tolerance=args.joint_position_tolerance,
+                    shutdown_check=rospy.is_shutdown,
+                    progress_interval=0.5 if args.debug_input else 0.0,
+                    progress_callback=_print_joint_reset_progress,
+                ):
+                    print("Failed to reset to origin joints.", file=sys.stderr)
+                    return 9
+                if not _wait_until_stationary(
+                    robot,
+                    args.handoff_stationary_timeout,
+                    args.stationary_joint_speed,
+                    args.stationary_cycles,
+                    1.0 / args.control_freq,
+                ):
+                    print("Robot did not become stationary after joint reset.", file=sys.stderr)
+                    return 10
+                origin_pos, origin_quat = _capture_pose_target(robot)
+                if origin_pos is None or origin_quat is None:
                     print("Robot pose is unavailable after reset.", file=sys.stderr)
-                    return 8
-                command_pos = desired_pos.copy()
-                command_quat = desired_quat.copy()
+                    return 11
+                desired_pos, desired_quat = _reset_target_to_origin(origin_pos, origin_quat)
                 tool_pos, tool_quat, _ = _current_tool_pose(robot, eef_offset, eef_offset_rot)
                 if tool_pos is not None and tool_quat is not None:
                     admittance_pos = tool_pos.copy()
@@ -810,7 +822,9 @@ def main() -> int:
                     is_in_contact = False
                     break_contact_timer = 0.0
                     current_kp_z = kp_z_free
-                force_send = True
+                _prepare_handoff(robot, hard_reset=True)
+                force_send = False
+                loop_idx = 0
                 rate.sleep()
                 continue
 
@@ -819,21 +833,9 @@ def main() -> int:
             if np.linalg.norm(sn_ang) < args.angular_deadzone:
                 sn_ang[:] = 0.0
 
-            now = time.monotonic()
-            if args.debug_input and now - last_debug_time >= 0.25:
-                input_age = max(0.0, now - last_twist_time) if last_twist_time > 0.0 else float("inf")
-                _info(
-                    "SpaceNav input: "
-                    f"mode={active_mode} "
-                    f"raw_lin={np.linalg.norm(raw_sn_lin):.6f} "
-                    f"raw_ang={np.linalg.norm(raw_sn_ang):.6f} "
-                    f"filtered_lin={np.linalg.norm(sn_lin):.6f} "
-                    f"filtered_ang={np.linalg.norm(sn_ang):.6f} "
-                    f"msg_age={input_age:.3f}s"
-                )
-                last_debug_time = now
-
-            input_active = np.linalg.norm(sn_lin) > 1e-12 or np.linalg.norm(sn_ang) > 1e-12
+            input_active = (
+                np.linalg.norm(sn_lin) > 1e-12 or np.linalg.norm(sn_ang) > 1e-12
+            )
             if active_mode != MODE_ADMITTANCE and input_active:
                 desired_pos, desired_quat = _integrate_absolute_target(
                     desired_pos,
@@ -844,52 +846,20 @@ def main() -> int:
                     args.linear_scale,
                     args.angular_scale,
                 )
-                force_send = True
+
+            _publish_target(target_pub, args.target_frame, desired_pos, desired_quat)
 
             current_pose = robot.last_eef_pose
             if current_pose is None:
                 rate.sleep()
                 continue
 
+            pos_error = 0.0
+            rot_error = 0.0
             admittance_have_force = False
             admittance_f_error = 0.0
             admittance_action_z = 0.0
-            if active_mode == MODE_CARTESIAN:
-                command_pos, command_quat, target_pos_error, target_rot_error = _step_command_target(
-                    command_pos,
-                    command_quat,
-                    desired_pos,
-                    desired_quat,
-                    args.command_max_pos_step,
-                    args.command_max_rot_step,
-                )
-                target_pending = target_pos_error > 1e-5 or target_rot_error > 1e-4
-                if force_send or target_pending or args.max_steps == 0 or steps < args.max_steps:
-                    action = _build_absolute_action(command_pos, command_quat)
-                    robot.control("CARTESIAN_VELOCITY", action, controller_cfg=cartesian_cfg)
-                    steps += 1
-            elif active_mode == MODE_OSC:
-                command_pos, command_quat, target_pos_error, target_rot_error = _step_command_target(
-                    command_pos,
-                    command_quat,
-                    desired_pos,
-                    desired_quat,
-                    args.command_max_pos_step,
-                    args.command_max_rot_step,
-                )
-                target_pending = target_pos_error > 1e-5 or target_rot_error > 1e-4
-                action = _build_osc_delta_action(
-                    current_pose,
-                    command_pos,
-                    command_quat,
-                    args.osc_max_pos_delta,
-                    args.osc_max_rot_delta,
-                )
-                delta_norm = max(np.linalg.norm(action[:3]), np.linalg.norm(action[3:6]))
-                if force_send or target_pending or delta_norm > 1e-5:
-                    robot.control("OSC_POSE", action, controller_cfg=osc_cfg)
-                    steps += 1
-            else:
+            if active_mode == MODE_ADMITTANCE:
                 tool_pos, tool_quat, link8_rot = _current_tool_pose(
                     robot, eef_offset, eef_offset_rot
                 )
@@ -945,7 +915,7 @@ def main() -> int:
                     else:
                         break_contact_timer = 0.0
 
-                fz_dot = (fz_comp - fz_prev) / dt
+                fz_dot = (fz_comp - fz_prev) / dt if dt > 1e-9 else 0.0
                 fz_prev = fz_comp
 
                 if is_in_contact:
@@ -962,11 +932,10 @@ def main() -> int:
                         - force_derivative_gain * fz_dot
                         - damping_eff * admittance_vel
                     ) / admittance_mass
-                    admittance_acc = float(np.clip(admittance_acc, -accel_limit, accel_limit))
                 else:
                     target_kp_z = kp_z_free
                     admittance_acc = (-(200.0 + damping_down) * admittance_vel) / admittance_mass
-                    admittance_acc = float(np.clip(admittance_acc, -accel_limit, accel_limit))
+                admittance_acc = float(np.clip(admittance_acc, -accel_limit, accel_limit))
 
                 admittance_vel += admittance_acc * dt
                 admittance_vel = float(
@@ -991,60 +960,100 @@ def main() -> int:
                     float(current_kp_z),
                 ]
 
-                pos_error = admittance_pos - tool_pos
+                pos_vec = admittance_pos - tool_pos
                 if is_in_contact:
-                    xy_norm = float(np.linalg.norm(pos_error[:2]))
+                    xy_norm = float(np.linalg.norm(pos_vec[:2]))
                     if xy_norm > max_position_error:
                         admittance_pos[:2] = (
-                            tool_pos[:2] + pos_error[:2] * (max_position_error / xy_norm)
+                            tool_pos[:2] + pos_vec[:2] * (max_position_error / xy_norm)
                         )
-                        pos_error = admittance_pos - tool_pos
+                        pos_vec = admittance_pos - tool_pos
                 else:
-                    pos_norm = float(np.linalg.norm(pos_error))
+                    pos_norm = float(np.linalg.norm(pos_vec))
                     if pos_norm > max_position_error:
-                        admittance_pos = tool_pos + pos_error * (max_position_error / pos_norm)
-                        pos_error = admittance_pos - tool_pos
+                        admittance_pos = tool_pos + pos_vec * (max_position_error / pos_norm)
+                        pos_vec = admittance_pos - tool_pos
 
                 delta_quat = transform_utils.quat_distance(
-                    canonicalize_quaternion(admittance_quat, reference_quat_xyzw=tool_quat),
+                    _canonicalize_tool_quaternion(
+                        admittance_quat, reference_quat_xyzw=tool_quat
+                    ),
                     tool_quat,
                 ).astype(np.float64)
-                rot_error = transform_utils.quat2axisangle(
-                    canonicalize_quaternion(delta_quat)
+                rot_vec = transform_utils.quat2axisangle(
+                    _canonicalize_tool_quaternion(delta_quat)
                 ).astype(np.float64)
-                rot_norm = float(np.linalg.norm(rot_error))
+                rot_norm = float(np.linalg.norm(rot_vec))
                 if rot_norm > max_rotation_error:
-                    rot_error = rot_error * (max_rotation_error / rot_norm)
+                    rot_vec = rot_vec * (max_rotation_error / rot_norm)
 
-                max_pos_step = float(admittance_cfg["action_scale"]["translation"])
-                max_rot_step = float(admittance_cfg["action_scale"]["rotation"])
-                action_pos = np.clip(pos_error, -max_pos_step, max_pos_step)
+                pos_error = float(np.linalg.norm(pos_vec))
+                rot_error = float(np.linalg.norm(rot_vec))
+                action_pos = np.clip(
+                    pos_vec,
+                    -float(admittance_cfg["action_scale"]["translation"]),
+                    float(admittance_cfg["action_scale"]["translation"]),
+                )
                 admittance_action_z = float(action_pos[2])
-                action_rot = np.clip(rot_error, -max_rot_step, max_rot_step)
+                action_rot = np.clip(
+                    rot_vec,
+                    -float(admittance_cfg["action_scale"]["rotation"]),
+                    float(admittance_cfg["action_scale"]["rotation"]),
+                )
                 action = np.concatenate([action_pos, action_rot, [-1.0]])
                 robot.control("OSC_POSE", action, controller_cfg=admittance_cfg)
                 steps += 1
-                if (
-                    args.admittance_debug_interval > 0.0
-                    and now - last_admittance_debug_time >= args.admittance_debug_interval
-                ):
-                    _info(
-                        "Admittance debug: "
-                        f"force_ready={int(admittance_have_force)} "
-                        f"contact={int(is_in_contact)} "
-                        f"fz={fz_comp:.3f}N "
-                        f"target_fz={force_target_z:.3f}N "
-                        f"f_err={admittance_f_error:.3f}N "
-                        f"adm_vel={admittance_vel:.4f}m/s "
-                        f"adm_z={admittance_pos[2] - admittance_start_z:.4f}m "
-                        f"action_z={admittance_action_z:.4f}m "
-                        f"kp_z={current_kp_z:.1f}"
-                    )
-                    last_admittance_debug_time = now
-            force_send = False
+                sent_command = True
+                force_send = False
+            else:
+                pos_error, rot_error = _pose_error(current_pose, desired_pos, desired_quat)
+                target_pending = pos_error > 1e-3 or rot_error > 1e-2
+                should_send = force_send or (
+                    (input_active or target_pending) and loop_idx % send_every_n == 0
+                )
+
+                if should_send:
+                    if active_mode == MODE_CARTESIAN:
+                        action = _build_absolute_action(desired_pos, desired_quat)
+                        robot.control(
+                            "CARTESIAN_VELOCITY", action, controller_cfg=cartesian_cfg
+                        )
+                    else:
+                        action = _build_osc_delta_action(
+                            current_pose,
+                            desired_pos,
+                            desired_quat,
+                            args.osc_max_pos_delta,
+                            args.osc_max_rot_delta,
+                        )
+                        robot.control("OSC_POSE", action, controller_cfg=osc_cfg)
+                    steps += 1
+                    sent_command = True
+                    force_send = False
+
+            if args.debug_input and now - last_debug_time >= 0.25:
+                input_age = (
+                    max(0.0, now - last_twist_time)
+                    if last_twist_time > 0.0
+                    else float("inf")
+                )
+                _info(
+                    "Async robust: "
+                    f"mode={active_mode} "
+                    f"send_every_n={send_every_n} "
+                    f"raw_lin={np.linalg.norm(raw_sn_lin):.6f} "
+                    f"raw_ang={np.linalg.norm(raw_sn_ang):.6f} "
+                    f"pos_err={pos_error:.4f} "
+                    f"rot_err={rot_error:.4f} "
+                    f"sent={int(sent_command)} "
+                    f"dt={dt:.4f} "
+                    f"msg_age={input_age:.3f}s"
+                )
+                last_debug_time = now
 
             if args.max_steps > 0 and steps >= args.max_steps:
                 break
+            loop_idx += 1
             rate.sleep()
     except KeyboardInterrupt:
         pass

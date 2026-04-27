@@ -53,6 +53,7 @@ setup(
             'peirastic.test_spacenav_admittance=peirastic.scripts.test_spacenav_admittance:main',
             'peirastic.spacenav_cartesian_min=peirastic.scripts.spacenav_cartesian_min:main',
             'peirastic.spacenav_mode_switch_test=peirastic.scripts.spacenav_mode_switch_test:main',
+            'peirastic.spacenav_async_robust_test=peirastic.scripts.spacenav_async_robust_test:main',
             'peirastic.spacemouse_osc=peirastic.scripts.run_spacemouse_osc:main',
             'peirastic.spacemouse_control=peirastic.scripts.run_spacemouse_osc:main',
             'peirastic.spacemouse_cartesian_min=peirastic.scripts.spacemouse_cartesian_min:main',

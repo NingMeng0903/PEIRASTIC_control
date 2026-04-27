@@ -2,6 +2,7 @@
 
 #include "base_traj_interpolator.h"
 #include <Eigen/Dense>
+#include <algorithm>
 #ifndef DEOXYS_FRANKA_INTERFACE_INCLUDE_UTILS_TRAJ_INTERPOLATORS_SMOOTH_JOINT_TRAJ_INTERPOLATOR_H_
 #define DEOXYS_FRANKA_INTERFACE_INCLUDE_UTILS_TRAJ_INTERPOLATORS_SMOOTH_JOINT_TRAJ_INTERPOLATOR_H_
 
@@ -23,10 +24,15 @@ private:
   Vector7d t_f_sync_;
   Vector7d q_1_;
 
-  Vector7d dq_max_ =
+  const Vector7d base_dq_max_ =
       (Vector7d() << 2.0, 2.0, 2.0, 2.0, 2.5, 2.5, 2.5).finished();
-  Vector7d ddq_max_start_ = (Vector7d() << 1, 1, 1, 1, 1, 1, 1).finished();
-  Vector7d ddq_max_goal_ = (Vector7d() << 1, 1, 1, 1, 1, 1, 1).finished();
+  const Vector7d base_ddq_max_start_ =
+      (Vector7d() << 1, 1, 1, 1, 1, 1, 1).finished();
+  const Vector7d base_ddq_max_goal_ =
+      (Vector7d() << 1, 1, 1, 1, 1, 1, 1).finished();
+  Vector7d dq_max_;
+  Vector7d ddq_max_start_;
+  Vector7d ddq_max_goal_;
 
   static constexpr double kDeltaQMotionFinished = 1e-6;
 
@@ -35,15 +41,15 @@ private:
   double start_time_;
   bool start_;
   bool first_goal_;
-  bool speed_factor_;
+  double speed_factor_;
 
 public:
   inline SmoothJointTrajInterpolator()
       : dt_(0.), max_time_(1.), start_time_(0.), start_(false),
         first_goal_(true), speed_factor_(0.01) {
-    dq_max_ *= speed_factor_;
-    ddq_max_start_ *= speed_factor_;
-    ddq_max_goal_ *= speed_factor_;
+    dq_max_ = base_dq_max_ * speed_factor_;
+    ddq_max_start_ = base_ddq_max_start_ * speed_factor_;
+    ddq_max_goal_ = base_ddq_max_goal_ * speed_factor_;
   };
 
   inline ~SmoothJointTrajInterpolator(){};
@@ -53,6 +59,12 @@ public:
                     const Eigen::Matrix<double, 7, 1> &q_goal,
                     const int &policy_rate, const int &rate,
                     const double &traj_interpolator_time_fraction) {
+    speed_factor_ =
+        std::max(0.01, std::min(1.0, traj_interpolator_time_fraction));
+    dq_max_ = base_dq_max_ * speed_factor_;
+    ddq_max_start_ = base_ddq_max_start_ * speed_factor_;
+    ddq_max_goal_ = base_ddq_max_goal_ * speed_factor_;
+
     bool goal_changed = false;
     for (size_t i = 0; i < 7; i++) {
       if (std::abs(q_goal[i] - prev_q_goal_[i]) > kDeltaQMotionFinished) {

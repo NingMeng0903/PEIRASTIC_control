@@ -1,6 +1,7 @@
 // Copyright 2022 Yifeng Zhu
 
 #include <atomic>
+#include <chrono>
 #include <iostream>
 #include <mutex>
 #include <string>

@@ -139,7 +139,8 @@ public:
         initialized_before &&
         SameGoalQuaternion(prev_goal_quaternion, normalized_goal_quaternion);
 
-    if (initialized_before && same_goal_position && same_goal_quaternion) {
+    if (initialized_before && has_motion_state_ && same_goal_position &&
+        same_goal_quaternion) {
       return;
     }
 

@@ -796,24 +796,46 @@ class FrankaInterface:
         timeout: float = 10.0,
         position_tolerance: float = 1e-3,
         state_timeout: float = 5.0,
+        shutdown_check: Optional[Callable[[], bool]] = None,
+        progress_interval: float = 0.0,
+        progress_callback: Optional[Callable[[float, float], None]] = None,
     ) -> bool:
         q_target = self._normalize_joint_target(joint_positions)
         cfg = self._as_absolute_controller_cfg(controller_cfg, "JOINT_POSITION")
         action = q_target.tolist() + [float(gripper_action)]
 
         if not blocking:
-            self.control("JOINT_POSITION", action, controller_cfg=cfg)
+            self.control("JOINT_POSITION", action, controller_cfg=cfg, shutdown_check=shutdown_check)
             return True
 
         if not self.wait_for_state(timeout=state_timeout):
             return False
 
         deadline = time.time() + timeout
+        last_progress_time = 0.0
         while time.time() < deadline:
+            if shutdown_check is not None and shutdown_check():
+                return False
             current_q = self.last_q
-            if current_q is not None and np.max(np.abs(current_q - q_target)) <= position_tolerance:
-                return True
-            self.control("JOINT_POSITION", action, controller_cfg=cfg)
+            if current_q is not None:
+                max_position_error = float(np.max(np.abs(current_q - q_target)))
+                if progress_interval > 0.0 and time.time() - last_progress_time >= progress_interval:
+                    current_dq = self.last_dq
+                    max_joint_speed = (
+                        float(np.max(np.abs(current_dq))) if current_dq is not None else float("nan")
+                    )
+                    if progress_callback is not None:
+                        progress_callback(max_position_error, max_joint_speed)
+                    else:
+                        logger.info(
+                            "move_joints progress: max_position_error=%.6f max_joint_speed=%.6f",
+                            max_position_error,
+                            max_joint_speed,
+                        )
+                    last_progress_time = time.time()
+                if max_position_error <= position_tolerance:
+                    return True
+            self.control("JOINT_POSITION", action, controller_cfg=cfg, shutdown_check=shutdown_check)
 
         current_q = self.last_q
         return current_q is not None and np.max(np.abs(current_q - q_target)) <= position_tolerance
@@ -829,6 +851,9 @@ class FrankaInterface:
         timeout: float = 10.0,
         position_tolerance: float = 1e-3,
         state_timeout: float = 5.0,
+        shutdown_check: Optional[Callable[[], bool]] = None,
+        progress_interval: float = 0.0,
+        progress_callback: Optional[Callable[[float, float], None]] = None,
     ) -> bool:
         q_target = self._resolve_named_joint_target(name_or_q, named_targets=named_targets)
         return self.move_joints(
@@ -839,6 +864,9 @@ class FrankaInterface:
             timeout=timeout,
             position_tolerance=position_tolerance,
             state_timeout=state_timeout,
+            shutdown_check=shutdown_check,
+            progress_interval=progress_interval,
+            progress_callback=progress_callback,
         )
 
     def move_pose(
@@ -852,13 +880,14 @@ class FrankaInterface:
         position_tolerance: float = 2e-3,
         rotation_tolerance: float = 5e-2,
         state_timeout: float = 5.0,
+        shutdown_check: Optional[Callable[[], bool]] = None,
     ) -> bool:
         pose_vec = self._normalize_pose_target(target_pose)
         cfg = self._as_absolute_controller_cfg(controller_cfg, "CARTESIAN_VELOCITY")
         action = pose_vec.tolist() + [float(gripper_action)]
 
         if not blocking:
-            self.control("CARTESIAN_VELOCITY", action, controller_cfg=cfg)
+            self.control("CARTESIAN_VELOCITY", action, controller_cfg=cfg, shutdown_check=shutdown_check)
             return True
 
         if not self.wait_for_state(timeout=state_timeout):
@@ -875,12 +904,14 @@ class FrankaInterface:
 
         deadline = time.time() + timeout
         while time.time() < deadline:
+            if shutdown_check is not None and shutdown_check():
+                return False
             current_pose = self.last_eef_pose
             if current_pose is not None:
                 pos_error, rot_error = self._pose_error(current_pose, target_pose_mat)
                 if pos_error <= position_tolerance and rot_error <= rotation_tolerance:
                     return True
-            self.control("CARTESIAN_VELOCITY", action, controller_cfg=cfg)
+            self.control("CARTESIAN_VELOCITY", action, controller_cfg=cfg, shutdown_check=shutdown_check)
 
         current_pose = self.last_eef_pose
         if current_pose is None:
@@ -899,6 +930,7 @@ class FrankaInterface:
         position_tolerance: float = 2e-3,
         rotation_tolerance: float = 5e-2,
         state_timeout: float = 5.0,
+        shutdown_check: Optional[Callable[[], bool]] = None,
     ) -> bool:
         return self.move_pose(
             target_pose,
@@ -909,6 +941,7 @@ class FrankaInterface:
             position_tolerance=position_tolerance,
             rotation_tolerance=rotation_tolerance,
             state_timeout=state_timeout,
+            shutdown_check=shutdown_check,
         )
 
     def close(self):
@@ -928,13 +961,13 @@ class FrankaInterface:
                 socket.close(0)
             except zmq.ZMQError:
                 pass
+
+        self._state_sub_thread.join(1.0)
+        self._gripper_sub_thread.join(1.0)
         try:
             self._context.term()
         except zmq.ZMQError:
             pass
-
-        self._state_sub_thread.join(1.0)
-        self._gripper_sub_thread.join(1.0)
 
     @property
     def last_eef_pose(self) -> np.ndarray:

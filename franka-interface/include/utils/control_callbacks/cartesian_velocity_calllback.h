@@ -172,7 +172,7 @@ CreateCartesianVelocitiesCallback(
       const double max_velocity_step =
           velocity_controller->GetCommandAccelerationLimit() * dt;
       if (!global_handler->has_previous_cartesian_velocity_command) {
-        global_handler->previous_cartesian_velocity_command = vel_d_array;
+        global_handler->previous_cartesian_velocity_command = robot_state.O_dP_EE_c;
         global_handler->has_previous_cartesian_velocity_command = true;
       }
       for (size_t i = 0; i < vel_d_array.size(); ++i) {
